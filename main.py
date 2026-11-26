@@ -47,7 +47,7 @@ def is_youtube_url(url: str) -> bool:
 def build_base_ydl_opts(url: str, cookie_path: str | None) -> dict:
     opts = {
         "quiet": False,
-        "verbose": True,  # Helpful in Render Logs for diagnosing blocks
+        "verbose": True,
         "no_warnings": False,
         "noplaylist": True,
         "nocheckcertificate": True,
@@ -55,15 +55,24 @@ def build_base_ydl_opts(url: str, cookie_path: str | None) -> dict:
     }
 
     if is_youtube_url(url):
-        if cookie_path:
-            opts["cookiefile"] = cookie_path
+        po_token = os.getenv("MlNTpK65TX7lR1OYYks2VW3sPUmpPgxvwsN-ih4ySMvz6TTLq_bvhPZWf5tyvNLSPzlBnWZW7AgSwaEbEra36OnfV5iaLTxxdEH7KcAGNdu_6BRGOQ==", "").strip()
+        visitor_data = os.getenv("CgtUMEVJcDFjUElJMCiinqDYBjIKCgJLSBIEGgAgLWLDAgrAAkN1MEJDQVVTbndFQkRCNlBER21TZzY0TXFwME5KekUyQk1RLTV4T2Q2SmlJY2tiZEtIdHUxRU0xSGNoTDB1QXlxTHFqZUZZb2xPNno3UWpPTUhtMXJiQkV4MVlzVXBXbFhQQmlIdGlUQ19iVF9xUmItOHVnQTZNQi1CcEQyTElUVmVDeWZYTVo0eXVUeHlIYm03bDl6ODJxakh3WHVtS1o1aHNnQkxIa1I0T1VyMWVWaldYM3VDZ0xyMDE0X3JTVVJsSnJzWkFQZGtPQkk5ZW45NFlaUkJwQmZ0c2ZoTU1vQlRKRkFSeFk5V3JxYW9aOEwyTm4ydWNqQUpJT0xqVXAySktqLXRVLTdNSHZEbkFjU01CQWNKVnBQamJQYlc1Z1NONUNILXc1V3l6a3lqQWVWVjY2NjBCZVRjZjV5aGdH", "").strip()
 
-        po_token = os.getenv("YOUTUBE_PO_TOKEN", "").strip()
         yt_args = {
-            "player_client": ["web", "mweb", "tv"],
+            "player_client": ["web", "mweb"],
         }
+
         if po_token:
-            yt_args["po_token"] = [f"web.gvs+{po_token}"]
+            # Support both raw token or already-prefixed token
+            token_val = po_token if "+" in po_token else f"web.gvs+{po_token}"
+            yt_args["po_token"] = [token_val]
+
+        # If visitor_data is set (logged-out PO token session), use it without cookies
+        # Otherwise fall back to writable cookies.txt if available
+        if visitor_data:
+            yt_args["visitor_data"] = [visitor_data]
+        elif cookie_path:
+            opts["cookiefile"] = cookie_path
 
         opts["extractor_args"] = {"youtube": yt_args}
 
@@ -151,7 +160,7 @@ def download_media(url: str, format_id: str | None, is_audio: bool = False) -> s
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(url, download=True)
         filename = ydl.prepare_filename(info)
-        base = os.path.splitext(filename)[0]
+        base, _ = os.path.splitext(filename)
 
         if is_audio:
             final_path = base + ".mp3"
