@@ -1,5 +1,5 @@
 fastapi
 uvicorn
-yt-dlp
+yt-dlp>=2026.11.23
 python-multipart
 jinja2
