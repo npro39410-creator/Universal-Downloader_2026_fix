@@ -1,0 +1,207 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Universal Video Downloader — 4K MP4 / MP3</title>
+    <style>
+        * { box-sizing: border-box; font-family: system-ui, -apple-system, sans-serif; }
+        body { background: #0f0f0f; color: #eee; display: flex; justify-content: center; padding: 2rem; margin: 0; }
+        .container { max-width: 760px; width: 100%; }
+        h1 { text-align: center; color: #ef124e; margin-bottom: 0.5rem; }
+        p.sub { text-align: center; color: #aaa; margin-top: 0; }
+        .card { background: #1e1e1e; border-radius: 12px; padding: 1.5rem; margin-bottom: 1.5rem; box-shadow: 0 4px 20px rgba(0,0,0,0.5); }
+        input[type="text"] { width: 100%; padding: 12px 16px; border-radius: 8px; border: 1px solid #333; background: #2a2a2a; color: #fff; font-size: 16px; margin-bottom: 1rem; }
+        input[type="text"]:focus { outline: none; border-color: #ef124e; }
+        button { background: #ef124e; color: #fff; border: none; padding: 12px 24px; border-radius: 8px; font-size: 16px; font-weight: 600; cursor: pointer; width: 100%; transition: 0.2s; }
+        button:hover { background: #d10e42; }
+        button:disabled { background: #555; cursor: not-allowed; }
+        .hidden { display: none; }
+        .video-info { display: flex; gap: 1rem; margin-bottom: 1rem; align-items: center; }
+        .video-info img { width: 140px; border-radius: 8px; }
+        .video-info h3 { margin: 0 0 4px; font-size: 16px; }
+        .video-info p { margin: 0; color: #aaa; font-size: 14px; }
+        .badge { display: inline-block; background: #ef124e; color: #fff; font-size: 11px; padding: 2px 8px; border-radius: 999px; margin-left: 6px; vertical-align: middle; }
+        .format-list { display: flex; flex-direction: column; gap: 8px; margin-top: 1rem; }
+        .format-item { display: flex; justify-content: space-between; align-items: center; background: #2a2a2a; padding: 12px; border-radius: 8px; }
+        .format-item .meta { display: flex; flex-direction: column; gap: 2px; }
+        .format-item .label { font-weight: 600; }
+        .format-item .details { font-size: 12px; color: #aaa; }
+        .format-item button { width: auto; padding: 8px 16px; font-size: 14px; }
+        .audio-option { margin-top: 1rem; padding-top: 1rem; border-top: 1px solid #333; }
+        .audio-option button { background: #333; }
+        .audio-option button:hover { background: #444; }
+        .error { color: #ff6b6b; text-align: center; margin-top: 1rem; }
+        .loading { text-align: center; color: #aaa; }
+    </style>
+</head>
+<body>
+    <div class="container">
+        <h1>Universal Downloader</h1>
+        <p class="sub">YouTube · TikTok · Facebook · X · Instagram — up to <b>8K</b></p>
+
+        <div class="card">
+            <form id="analyzeForm">
+                <input type="text" id="urlInput" placeholder="Paste video link here..." required>
+                <button type="submit" id="analyzeBtn">Analyze Link</button>
+            </form>
+            <div id="errorMsg" class="error hidden"></div>
+        </div>
+
+        <div id="resultCard" class="card hidden">
+            <div class="video-info">
+                <img id="thumb" src="" alt="Thumbnail" onerror="this.style.display='none'">
+                <div>
+                    <h3 id="videoTitle">Title</h3>
+                    <p id="videoMeta">Uploader · Duration</p>
+                </div>
+            </div>
+
+            <h4>Download Video (MP4)</h4>
+            <div id="formatList" class="format-list"></div>
+
+            <div class="audio-option">
+                <h4>Download Audio Only (MP3 · 320 kbps)</h4>
+                <button id="downloadMp3Btn">Download MP3</button>
+            </div>
+        </div>
+    </div>
+
+    <script>
+        const analyzeForm = document.getElementById('analyzeForm');
+        const urlInput = document.getElementById('urlInput');
+        const analyzeBtn = document.getElementById('analyzeBtn');
+        const resultCard = document.getElementById('resultCard');
+        const formatList = document.getElementById('formatList');
+        const errorMsg = document.getElementById('errorMsg');
+        const thumb = document.getElementById('thumb');
+        const videoTitle = document.getElementById('videoTitle');
+        const videoMeta = document.getElementById('videoMeta');
+        const downloadMp3Btn = document.getElementById('downloadMp3Btn');
+
+        let currentUrl = '';
+
+        function showError(msg) {
+            errorMsg.textContent = msg;
+            errorMsg.classList.remove('hidden');
+        }
+        function hideError() { errorMsg.classList.add('hidden'); }
+
+        function highlightBadge(label) {
+            if (label.startsWith('8K')) return '<span class="badge">8K</span>';
+            if (label.startsWith('4K')) return '<span class="badge">4K</span>';
+            if (label.startsWith('2K')) return '<span class="badge">2K</span>';
+            if (label.startsWith('1080')) return '<span class="badge">HD</span>';
+            return '';
+        }
+
+        analyzeForm.addEventListener('submit', async (e) => {
+            e.preventDefault();
+            hideError();
+            resultCard.classList.add('hidden');
+            const url = urlInput.value.trim();
+            if (!url) return;
+
+            analyzeBtn.disabled = true;
+            analyzeBtn.textContent = 'Analyzing...';
+
+            const formData = new FormData();
+            formData.append('url', url);
+
+            try {
+                const res = await fetch('/analyze', { method: 'POST', body: formData });
+                if (!res.ok) {
+                    const err = await res.json();
+                    throw new Error(err.detail || 'Failed to analyze link.');
+                }
+                const data = await res.json();
+                currentUrl = data.webpage_url || url;
+
+                videoTitle.textContent = data.title;
+                const mins = Math.floor(data.duration / 60);
+                const secs = data.duration % 60;
+                videoMeta.textContent = `${data.uploader} · ${mins}:${secs.toString().padStart(2, '0')}`;
+                if (data.thumbnail) {
+                    thumb.src = data.thumbnail;
+                    thumb.style.display = 'block';
+                } else {
+                    thumb.style.display = 'none';
+                }
+
+                formatList.innerHTML = '';
+                if (data.formats.length === 0) {
+                    formatList.innerHTML = '<p class="loading">No video formats found. Try MP3 instead.</p>';
+                } else {
+                    data.formats.forEach(f => {
+                        const div = document.createElement('div');
+                        div.className = 'format-item';
+                        div.innerHTML = `
+                            <div class="meta">
+                                <span class="label">${f.label} ${highlightBadge(f.label)}</span>
+                                <span class="details">${f.vcodec || ''} · ${f.size_human}</span>
+                            </div>
+                            <button data-format="${f.format_id}">Download</button>
+                        `;
+                        formatList.appendChild(div);
+                    });
+                }
+
+                resultCard.classList.remove('hidden');
+            } catch (err) {
+                showError(err.message);
+            } finally {
+                analyzeBtn.disabled = false;
+                analyzeBtn.textContent = 'Analyze Link';
+            }
+        });
+
+        formatList.addEventListener('click', async (e) => {
+            if (e.target.tagName !== 'BUTTON') return;
+            await triggerDownload(currentUrl, e.target.dataset.format, false, e.target);
+        });
+
+        downloadMp3Btn.addEventListener('click', async () => {
+            await triggerDownload(currentUrl, '', true, downloadMp3Btn);
+        });
+
+        async function triggerDownload(url, formatId, audioOnly, btnElement) {
+            const originalText = btnElement.textContent;
+            btnElement.disabled = true;
+            btnElement.textContent = 'Downloading...';
+
+            const formData = new FormData();
+            formData.append('url', url);
+            if (formatId) formData.append('format_id', formatId);
+            formData.append('audio_only', audioOnly);
+
+            try {
+                const res = await fetch('/download', { method: 'POST', body: formData });
+                if (!res.ok) {
+                    const err = await res.json();
+                    throw new Error(err.detail || 'Download failed.');
+                }
+                const blob = await res.blob();
+                const cd = res.headers.get('content-disposition');
+                let filename = audioOnly ? 'audio.mp3' : 'video.mp4';
+                if (cd) {
+                    const match = cd.match(/filename="?([^"]+)"?/);
+                    if (match) filename = match[1];
+                }
+                const downloadUrl = window.URL.createObjectURL(blob);
+                const a = document.createElement('a');
+                a.href = downloadUrl;
+                a.download = filename;
+                document.body.appendChild(a);
+                a.click();
+                a.remove();
+                window.URL.revokeObjectURL(downloadUrl);
+            } catch (err) {
+                alert(err.message);
+            } finally {
+                btnElement.disabled = false;
+                btnElement.textContent = originalText;
+            }
+        }
+    </script>
+</body>
+</html>
