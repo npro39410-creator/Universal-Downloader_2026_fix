@@ -1,181 +1,76 @@
 import os
+import shutil
+import tempfile
 import yt_dlp
-from fastapi import FastAPI, Request, Form, HTTPException
+from pathlib import Path
+from fastapi import FastAPI, Request, Form, HTTPException, BackgroundTasks
 from fastapi.responses import HTMLResponse, FileResponse
 from fastapi.templating import Jinja2Templates
-from pathlib import Path
-
-# Print yt-dlp version on startup so you can verify it in Render logs
-print(f"DEBUG: yt-dlp version: {yt_dlp.version.__version__}")
 
 app = FastAPI()
 
-# Setup folders
 BASE_DIR = Path(__file__).resolve().parent
 DOWNLOAD_DIR = BASE_DIR / "downloads"
 DOWNLOAD_DIR.mkdir(exist_ok=True)
 
 templates = Jinja2Templates(directory="templates")
 
+RENDER_COOKIE_PATH = Path("/etc/secrets/cookies.txt")
+LOCAL_COOKIE_PATH = BASE_DIR / "cookies.txt"
 
-# ---------- Helper: Get video info ----------
-def get_video_info(url: str):
-    ydl_opts = {
-        'quiet': True,
-        'no_warnings': True,
-        'skip_download': True,
-        'extract_flat': False,
-        'noplaylist': True,
-        # CRITICAL FIX: Tell YouTube we are an Android/iOS/TV app to bypass cloud IP blocks
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'ios', 'tv', 'web_safari'],
-            }
-        },
+
+# ---------- Helper: Prepare writable cookies ----------
+def get_writable_cookies() -> str | None:
+    """
+    Render mounts /etc/secrets/cookies.txt as read-only.
+    yt-dlp tries to write back to the cookie file, so we copy it to a temp path.
+    """
+    source = None
+    if RENDER_COOKIE_PATH.exists():
+        source = RENDER_COOKIE_PATH
+    elif LOCAL_COOKIE_PATH.exists():
+        source = LOCAL_COOKIE_PATH
+
+    if not source:
+        return None
+
+    tmp_cookie = Path(tempfile.gettempdir()) / "yt_cookies_runtime.txt"
+    shutil.copyfile(source, tmp_cookie)
+    return str(tmp_cookie)
+
+
+def is_youtube_url(url: str) -> bool:
+    lowered = url.lower()
+    return "youtube.com" in lowered or "youtu.be" in lowered
+
+
+def build_base_ydl_opts(url: str, cookie_path: str | None) -> dict:
+    opts = {
+        "quiet": False,
+        "verbose": True,  # Helpful in Render Logs for diagnosing blocks
+        "no_warnings": False,
+        "noplaylist": True,
+        "nocheckcertificate": True,
+        "geo_bypass": True,
     }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            return ydl.extract_info(url, download=False)
-    except Exception as e:
-        print(f"ERROR during extraction: {str(e)}")
-        return {"error": str(e)}
 
+    if is_youtube_url(url):
+        if cookie_path:
+            opts["cookiefile"] = cookie_path
 
-# ---------- Helper: Download file ----------
-def download_media(url: str, format_id: str, is_audio: bool = False):
-    outtmpl = str(DOWNLOAD_DIR / "%(title).150B [%(id)s].%(ext)s")
-
-    # Base options to apply to both audio and video downloads
-    base_opts = {
-        'outtmpl': outtmpl,
-        'quiet': True,
-        'no_warnings': True,
-        'extractor_args': {
-            'youtube': {
-                'player_client': ['android', 'ios', 'tv', 'web_safari'],
-            }
-        },
-    }
-
-    if is_audio:
-        ydl_opts = {
-            **base_opts,
-            'format': 'bestaudio/best',
-            'postprocessors': [{
-                'key': 'FFmpegExtractAudio',
-                'preferredcodec': 'mp3',
-                'preferredquality': '320',
-            }],
+        po_token = os.getenv("YOUTUBE_PO_TOKEN", "").strip()
+        yt_args = {
+            "player_client": ["web", "mweb", "tv"],
         }
-    else:
-        if format_id:
-            fmt = f"{format_id}+bestaudio[ext=m4a]/{format_id}+bestaudio/{format_id}"
-        else:
-            fmt = "bestvideo+bestaudio/best"
-            
-        ydl_opts = {
-            **base_opts,
-            'format': fmt,
-            'merge_output_format': 'mp4',
-            'format_sort': ['ext:mp4:m4a', 'res', 'fps', 'vcodec:h264'],
-        }
+        if po_token:
+            yt_args["po_token"] = [f"web.gvs+{po_token}"]
 
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        info = ydl.extract_info(url, download=True)
-        filename = ydl.prepare_filename(info)
-        
-        if is_audio:
-            filename = os.path.splitext(filename)[0] + '.mp3'
-        else:
-            base = os.path.splitext(filename)[0]
-            if os.path.exists(base + '.mp4'):
-                filename = base + '.mp4'
-                
-        return filename
+        opts["extractor_args"] = {"youtube": yt_args}
+
+    return opts
 
 
-# ---------- Routes ----------
-@app.get("/", response_class=HTMLResponse)
-async def home(request: Request):
-    return templates.TemplateResponse(request=request, name="index.html")
-
-
-@app.post("/analyze")
-async def analyze(url: str = Form(...)):
-    info = get_video_info(url)
-    if "error" in info:
-        raise HTTPException(status_code=400, detail=info["error"])
-
-    formats = []
-    for f in info.get('formats', []):
-        # Skip audio-only streams here; we show MP3 separately
-        if f.get('vcodec') in (None, 'none'):
-            continue
-        
-        height = f.get('height')
-        if not height:
-            continue
-
-        formats.append({
-            'format_id': f.get('format_id'),
-            'ext': f.get('ext'),
-            'height': height,
-            'fps': f.get('fps'),
-            'vcodec': f.get('vcodec'),
-            'filesize': f.get('filesize') or f.get('filesize_approx'),
-            'label': quality_label(height, f.get('fps'), f.get('ext')),
-            'size_human': human_size(f.get('filesize') or f.get('filesize_approx')),
-        })
-
-    # Deduplicate: keep the BEST format per (height, ext, fps bucket)
-    best = {}
-    for f in formats:
-        fps_bucket = 60 if (f['fps'] or 0) >= 50 else 30
-        key = (f['height'], f['ext'], fps_bucket)
-        prev = best.get(key)
-        if prev is None or (f['filesize'] or 0) > (prev['filesize'] or 0):
-            best[key] = f
-
-    # Sort by height desc, then fps desc
-    ordered = sorted(
-        best.values(),
-        key=lambda x: (x['height'], x['fps'] or 0),
-        reverse=True,
-    )
-
-    return {
-        "title": info.get('title', 'Unknown'),
-        "thumbnail": info.get('thumbnail', ''),
-        "duration": info.get('duration', 0),
-        "uploader": info.get('uploader', 'Unknown'),
-        "formats": ordered[:15],
-        "webpage_url": info.get('webpage_url', url),
-    }
-
-
-@app.post("/download")
-async def download(
-    url: str = Form(...),
-    format_id: str = Form(None),
-    audio_only: bool = Form(False),
-):
-    try:
-        filepath = download_media(url, format_id, audio_only)
-        if not os.path.exists(filepath):
-            raise HTTPException(status_code=500, detail="File not found after download.")
-
-        filename = os.path.basename(filepath)
-        return FileResponse(
-            path=filepath,
-            filename=filename,
-            media_type='application/octet-stream',
-        )
-    except Exception as e:
-        print(f"ERROR during download: {str(e)}")
-        raise HTTPException(status_code=500, detail=str(e))
-
-
-# ---------- Helper functions for labels ----------
+# ---------- Helper: Quality label ----------
 def quality_label(height, fps=None, ext=None):
     if not height:
         return "Audio"
@@ -206,3 +101,156 @@ def human_size(num):
             return f"{num:.1f} {unit}"
         num /= 1024
     return f"{num:.1f} TB"
+
+
+# ---------- Helper: Get video info ----------
+def get_video_info(url: str):
+    cookie_path = get_writable_cookies()
+    ydl_opts = build_base_ydl_opts(url, cookie_path)
+    ydl_opts.update({
+        "skip_download": True,
+        "extract_flat": False,
+    })
+
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    except Exception as e:
+        return {"error": str(e)}
+
+
+# ---------- Helper: Download file ----------
+def download_media(url: str, format_id: str | None, is_audio: bool = False) -> str:
+    cookie_path = get_writable_cookies()
+    ydl_opts = build_base_ydl_opts(url, cookie_path)
+    outtmpl = str(DOWNLOAD_DIR / "%(title).120B [%(id)s].%(ext)s")
+
+    if is_audio:
+        ydl_opts.update({
+            "format": "bestaudio/best",
+            "outtmpl": outtmpl,
+            "postprocessors": [{
+                "key": "FFmpegExtractAudio",
+                "preferredcodec": "mp3",
+                "preferredquality": "320",
+            }],
+        })
+    else:
+        if format_id:
+            fmt = f"{format_id}+bestaudio[ext=m4a]/{format_id}+bestaudio/{format_id}"
+        else:
+            fmt = "bestvideo+bestaudio/best"
+
+        ydl_opts.update({
+            "format": fmt,
+            "outtmpl": outtmpl,
+            "merge_output_format": "mp4",
+            "format_sort": ["ext:mp4:m4a", "res", "fps", "vcodec:h264"],
+        })
+
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(url, download=True)
+        filename = ydl.prepare_filename(info)
+        base = os.path.splitext(filename)[0]
+
+        if is_audio:
+            final_path = base + ".mp3"
+        elif os.path.exists(base + ".mp4"):
+            final_path = base + ".mp4"
+        else:
+            final_path = filename
+
+        return final_path
+
+
+def cleanup_file(path: str):
+    try:
+        if path and os.path.exists(path):
+            os.remove(path)
+    except OSError:
+        pass
+
+
+# ---------- Routes ----------
+@app.get("/", response_class=HTMLResponse)
+async def home(request: Request):
+    return templates.TemplateResponse(request=request, name="index.html")
+
+
+@app.post("/analyze")
+async def analyze(url: str = Form(...)):
+    url = url.strip()
+    if not url:
+        raise HTTPException(status_code=400, detail="Please enter a valid URL.")
+
+    info = get_video_info(url)
+    if not info or "error" in info:
+        err_msg = info.get("error", "Failed to extract video info.") if info else "Failed to extract video info."
+        raise HTTPException(status_code=400, detail=err_msg)
+
+    formats = []
+    for f in info.get("formats", []):
+        if f.get("vcodec") in (None, "none"):
+            continue
+        height = f.get("height")
+        if not height:
+            continue
+
+        size = f.get("filesize") or f.get("filesize_approx")
+        formats.append({
+            "format_id": f.get("format_id"),
+            "ext": f.get("ext"),
+            "height": height,
+            "fps": f.get("fps"),
+            "vcodec": f.get("vcodec"),
+            "filesize": size,
+            "label": quality_label(height, f.get("fps"), f.get("ext")),
+            "size_human": human_size(size),
+        })
+
+    best = {}
+    for f in formats:
+        fps_bucket = 60 if (f["fps"] or 0) >= 50 else 30
+        key = (f["height"], f["ext"], fps_bucket)
+        prev = best.get(key)
+        if prev is None or (f["filesize"] or 0) > (prev["filesize"] or 0):
+            best[key] = f
+
+    ordered = sorted(
+        best.values(),
+        key=lambda x: (x["height"], x["fps"] or 0),
+        reverse=True,
+    )
+
+    return {
+        "title": info.get("title", "Unknown"),
+        "thumbnail": info.get("thumbnail", ""),
+        "duration": info.get("duration", 0),
+        "uploader": info.get("uploader", "Unknown"),
+        "formats": ordered[:15],
+        "webpage_url": info.get("webpage_url", url),
+    }
+
+
+@app.post("/download")
+async def download(
+    background_tasks: BackgroundTasks,
+    url: str = Form(...),
+    format_id: str = Form(None),
+    audio_only: bool = Form(False),
+):
+    try:
+        filepath = download_media(url.strip(), format_id, audio_only)
+        if not os.path.exists(filepath):
+            raise HTTPException(status_code=500, detail="File not found after download.")
+
+        filename = os.path.basename(filepath)
+        background_tasks.add_task(cleanup_file, filepath)
+
+        return FileResponse(
+            path=filepath,
+            filename=filename,
+            media_type="application/octet-stream",
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
